@@ -1,0 +1,9 @@
+# Окружение, кэш и настройки редактора
+venv_arhimed_bot/
+__pycache__/
+.vscode/
+*.pyc
+
+# База данных и секреты 
+leads.db
+config.py
