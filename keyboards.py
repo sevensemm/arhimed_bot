@@ -77,12 +77,12 @@ def cancel_btn():
     )
     return kb
 
-def appointment_action_btn():
+def appointment_cancel_only_btn():
+    """Показывается, когда у пользователя уже есть активная запись — только отмена, без повторной записи."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Отменить запись", callback_data="appointment_cancel"),
-                InlineKeyboardButton(text="Записаться еще", callback_data="appointment_new")
             ],
             [
                 InlineKeyboardButton(text="Назад", callback_data="back_to_topics")

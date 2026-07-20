@@ -15,6 +15,17 @@ def _add_column_if_missing(conn, table: str, column: str, coltype: str):
     if column not in cols:
         conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {coltype}')
 
+def _drop_column_if_present(conn, table: str, column: str):
+    """Безопасно удаляет колонку, если она есть (поддерживается SQLite 3.35+)."""
+    cols = [row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+    if column in cols:
+        try:
+            conn.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+        except sqlite3.OperationalError:
+            # Старая версия SQLite не поддерживает DROP COLUMN — колонка
+            # останется в базе физически, но бот больше её не использует.
+            pass
+
 def create_tables():
     """Создает таблицы базы данных при старте бота (и накатывает недостающие колонки)."""
     with get_conn() as conn:
@@ -27,7 +38,6 @@ def create_tables():
                 topic TEXT,
                 name TEXT,
                 phone TEXT,
-                grade TEXT,
                 status TEXT DEFAULT 'new',
                 created_at TEXT,
                 updated_at TEXT
@@ -57,6 +67,8 @@ def create_tables():
         # Миграция: добавляем недостающие колонки в уже существующие БД
         _add_column_if_missing(conn, 'appointments', 'reminded', 'INTEGER DEFAULT 0')
         _add_column_if_missing(conn, 'leads', 'next_reminder_at', 'TEXT')
+        # Миграция: класс ребёнка больше не хранится
+        _drop_column_if_present(conn, 'leads', 'grade')
 
 
 # --- РАБОТА С ЛИДАМИ (Пользователями) ---
@@ -94,13 +106,13 @@ def update_lead_full(data: dict):
     with get_conn() as conn:
         conn.execute('''
             UPDATE leads 
-            SET name = ?, phone = ?, grade = ?, status = 'meeting_scheduled', updated_at = ?
+            SET name = ?, phone = ?, status = 'meeting_scheduled', updated_at = ?
             WHERE user_id = ?
-        ''', (data['name'], data['phone'], data['grade'], now, data['user_id']))
+        ''', (data['name'], data['phone'], now, data['user_id']))
 
-def update_lead_profile(user_id: int, name: str, phone: str, grade: str):
+def update_lead_profile(user_id: int, name: str, phone: str):
     """
-    Обновляет ФИО/телефон/класс лида, не трогая его статус записи
+    Обновляет ФИО/телефон лида, не трогая его статус записи
     (в отличие от update_lead_full, используется для правки данных
     из вкладки «Другое», а не в момент бронирования встречи).
     """
@@ -108,9 +120,9 @@ def update_lead_profile(user_id: int, name: str, phone: str, grade: str):
     with get_conn() as conn:
         conn.execute('''
             UPDATE leads
-            SET name = ?, phone = ?, grade = ?, updated_at = ?
+            SET name = ?, phone = ?, updated_at = ?
             WHERE user_id = ?
-        ''', (name, phone, grade, now, user_id))
+        ''', (name, phone, now, user_id))
 
 def get_lead(user_id: int) -> tuple:
     """Возвращает всю информацию о лиде."""
@@ -147,13 +159,39 @@ def get_booked_times(date_text: str) -> list:
         return [row[0] for row in rows]
 
 def get_user_appointments(user_id: int) -> list:
-    """Возвращает все активные записи конкретного пользователя."""
+    """Возвращает все активные (по статусу) записи конкретного пользователя, включая прошедшие даты."""
     with get_conn() as conn:
         return conn.execute('''
-            SELECT date_text, time_text, status FROM appointments 
+            SELECT id, date_text, time_text, status FROM appointments 
             WHERE user_id = ? AND status = 'scheduled'
             ORDER BY date_text, time_text
         ''', (user_id,)).fetchall()
+
+def get_active_user_appointments(user_id: int) -> list:
+    """
+    Возвращает записи пользователя, которые ещё актуальны: статус 'scheduled'
+    И дата встречи не в прошлом. Именно эти записи считаются "занимающими слот"
+    при проверке "нельзя записаться дважды" — прошедшие и отменённые не мешают.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        return conn.execute('''
+            SELECT id, date_text, time_text, status FROM appointments 
+            WHERE user_id = ? AND status = 'scheduled' AND date_text >= ?
+            ORDER BY date_text, time_text
+        ''', (user_id, today)).fetchall()
+
+def get_appointment_by_id(appointment_id: int) -> tuple:
+    """Возвращает запись по её ID (id, user_id, date_text, time_text, status)."""
+    with get_conn() as conn:
+        return conn.execute('''
+            SELECT id, user_id, date_text, time_text, status FROM appointments WHERE id = ?
+        ''', (appointment_id,)).fetchone()
+
+def cancel_appointment_by_id(appointment_id: int):
+    """Отменяет запись по её ID (освобождает слот)."""
+    with get_conn() as conn:
+        conn.execute("UPDATE appointments SET status = 'cancelled' WHERE id = ?", (appointment_id,))
 
 
 # --- ПАНЕЛЬ АДМИНИСТРАТОРА / СЛУЖЕБНЫЕ ЗАПРОСЫ ---
@@ -257,7 +295,7 @@ def get_export_rows() -> list:
     with get_conn() as conn:
         return conn.execute('''
             SELECT
-                l.user_id, l.username, l.name, l.phone, l.grade,
+                l.user_id, l.username, l.name, l.phone,
                 l.topic, l.status, l.created_at,
                 a.date_text, a.time_text, a.status
             FROM leads l

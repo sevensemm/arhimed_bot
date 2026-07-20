@@ -32,7 +32,6 @@ class States(StatesGroup):
     topic = State()
     name = State()
     phone = State()
-    grade = State()
     other = State()
     appointment_date = State()
     appointment_time = State()
@@ -138,13 +137,13 @@ async def meeting_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
     if action == "yes":
-        existing = get_user_appointments(user_id)
+        existing = get_active_user_appointments(user_id)
         if existing:
-            date_text, time_text, status = existing[0]
+            _, date_text, time_text, status = existing[0]
             await send_new(
                 callback.message,
                 m("APPOINTMENT_EXISTS").format(date_text, time_text),
-                appointment_action_btn()
+                appointment_cancel_only_btn()
             )
             await state.set_state(States.appointment_cancel)
         else:
@@ -163,18 +162,16 @@ async def appointment_action_handler(callback: CallbackQuery, state: FSMContext)
     user_id = callback.from_user.id
 
     if action == "cancel":
-        existing = get_user_appointments(user_id)
+        existing = get_active_user_appointments(user_id)
         if existing:
-            date_text, time_text, status = existing[0]
-            cancel_appointment(user_id, date_text, time_text)
+            apt_id, date_text, time_text, status = existing[0]
+            cancel_appointment_by_id(apt_id)
             await send_new(
                 callback.message,
                 m("APPOINTMENT_CANCELLED").format(date_text, time_text),
                 back_btn()
             )
             await state.clear()
-    elif action == "new":
-        await show_calendar(callback.message, state, edit=False)
     await callback.answer()
 
 @dp.callback_query(SimpleCalendarCallback.filter())
@@ -185,10 +182,16 @@ async def process_calendar(callback: CallbackQuery, callback_data: SimpleCalenda
     selected, date = await calendar.process_selection(callback, callback_data)
     if selected:
         if date.weekday() >= 5:  # 5 = суббота, 6 = воскресенье
+            # aiogram_calendar уже стирает клавиатуру сообщения при выборе дня
+            # (см. process_day_select -> message.delete_reply_markup()), поэтому
+            # простого callback.answer(show_alert=True) недостаточно —
+            # нужно заново отрисовать календарь, иначе пользователь останется
+            # с сообщением без кнопок.
             await callback.answer(
                 "Мы не работаем по выходным. Пожалуйста, выберите будний день (Пн–Пт).",
                 show_alert=True
             )
+            await show_calendar(callback.message, state, edit=True)
             return
         date_text = date.strftime("%Y-%m-%d")
         await state.update_data(selected_date=date_text)
@@ -244,6 +247,12 @@ async def time_selection_handler(callback: CallbackQuery, state: FSMContext):
     date_text = data.get("selected_date")
     user_id = callback.from_user.id
 
+    # Защита от повторной записи (на случай гонки/повторного клика):
+    # если у пользователя уже есть активная запись, второй раз забронировать нельзя.
+    if get_active_user_appointments(user_id):
+        await callback.answer("Вы уже записаны на встречу", show_alert=True)
+        return
+
     if get_appointment_by_date_time(date_text, time_slot):
         await callback.answer("Это время уже занято", show_alert=True)
         return
@@ -255,9 +264,9 @@ async def time_selection_handler(callback: CallbackQuery, state: FSMContext):
     set_next_reminder(user_id, None)
 
     lead = get_lead(user_id)
-    name, phone, grade = (lead[4], lead[5], lead[6]) if lead else (None, None, None)
+    name, phone = (lead[4], lead[5]) if lead else (None, None)
 
-    if name and phone and grade:
+    if name and phone:
         # Данные уже есть в профиле — повторно не спрашиваем
         update_status(user_id, "meeting_scheduled")
         await send_new(
@@ -267,12 +276,12 @@ async def time_selection_handler(callback: CallbackQuery, state: FSMContext):
         )
         await notify_admins(
             f"Новая запись на встречу (данные лида уже были в базе):\n"
-            f"ФИО: {name}\nТелефон: {phone}\nКласс: {grade}\n"
+            f"ФИО: {name}\nТелефон: {phone}\n"
             f"Дата/время: {date_text} {time_slot}\nUser ID: {user_id}"
         )
         await state.clear()
     else:
-        # Донабираем данные лида (ФИО/телефон/класс), чтобы они попали
+        # Донабираем данные лида (ФИО/телефон), чтобы они попали
         # в профиль лида и в Excel-выгрузку для админа.
         await state.update_data(booked_date=date_text, booked_time=time_slot)
         await send_new(callback.message, m("NAME_PROMPT"), cancel_btn())
@@ -312,10 +321,10 @@ async def other_handler(callback: CallbackQuery, state: FSMContext):
 
 async def show_profile(message: Message, user_id: int):
     lead = get_lead(user_id)
-    name, phone, grade = (lead[4], lead[5], lead[6]) if lead else (None, None, None)
+    name, phone = (lead[4], lead[5]) if lead else (None, None)
 
-    if name and phone and grade:
-        text = f"Ваши данные:\n\nФИО: {name}\nТелефон: {phone}\nКласс: {grade}"
+    if name and phone:
+        text = f"Ваши данные:\n\nФИО: {name}\nТелефон: {phone}"
     else:
         text = "Вы ещё не указывали свои данные."
 
@@ -329,24 +338,24 @@ async def show_profile(message: Message, user_id: int):
 @dp.callback_query(lambda c: c.data == "profile_edit")
 async def profile_edit_start(callback: CallbackQuery, state: FSMContext):
     # Явно очищаем state, чтобы это не спутали с процессом бронирования
-    # (иначе get_grade решит, что нужно ещё и записать на встречу)
+    # (иначе get_phone решит, что нужно ещё и записать на встречу)
     await state.clear()
     await send_new(callback.message, m("NAME_PROMPT"), cancel_btn())
     await state.set_state(States.name)
     await callback.answer()
 
 async def show_my_appointments(message: Message, user_id: int, state: FSMContext):
-    appointments = get_user_appointments(user_id)
+    appointments = get_active_user_appointments(user_id)
 
     if not appointments:
         await send_new(message, m("NO_APPOINTMENTS"), back_btn())
         return
 
     builder = InlineKeyboardBuilder()
-    for date_text, time_text, status in appointments:
+    for apt_id, date_text, time_text, status in appointments:
         builder.button(
             text=f"{date_text} {time_text} - Отменить",
-            callback_data=f"my_cancel_{date_text}_{time_text}"
+            callback_data=f"my_cancel_{apt_id}"
         )
     builder.button(text="Назад", callback_data="back_to_topics")
     builder.adjust(1)
@@ -357,11 +366,15 @@ async def show_my_appointments(message: Message, user_id: int, state: FSMContext
 @dp.callback_query(lambda c: c.data.startswith("my_cancel_"), StateFilter(States.my_appointments))
 async def my_cancel_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    parts = callback.data.replace("my_cancel_", "").split("_")
-    date_text = f"{parts[0]}-{parts[1]}-{parts[2]}"
-    time_text = parts[3]
+    apt_id = int(callback.data.replace("my_cancel_", ""))
 
-    cancel_appointment(user_id, date_text, time_text)
+    apt = get_appointment_by_id(apt_id)
+    if not apt or apt[1] != user_id:
+        await callback.answer("Запись не найдена, возможно она уже отменена.", show_alert=True)
+        return
+
+    date_text, time_text = apt[2], apt[3]
+    cancel_appointment_by_id(apt_id)
 
     await send_new(
         callback.message,
@@ -386,35 +399,28 @@ async def get_name(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(States.phone))
 async def get_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text)
-    await message.answer(m("GRADE_PROMPT"), reply_markup=cancel_btn())
-    await state.set_state(States.grade)
-
-@dp.message(StateFilter(States.grade))
-async def get_grade(message: Message, state: FSMContext):
     data = await state.get_data()
     name = data.get("name")
-    phone = data.get("phone")
-    grade = message.text
+    phone = message.text
     user_id = message.from_user.id
     date_text = data.get("booked_date")
     time_text = data.get("booked_time")
 
     if date_text and time_text:
         # Сценарий: донабор данных в процессе записи на встречу
-        update_lead_full({"name": name, "phone": phone, "grade": grade, "user_id": user_id})
+        update_lead_full({"name": name, "phone": phone, "user_id": user_id})
         await message.answer(
             m("APPOINTMENT_BOOKED").format(date_text, time_text),
             reply_markup=back_btn()
         )
         await notify_admins(
             f"Новая запись на встречу:\n"
-            f"ФИО: {name}\nТелефон: {phone}\nКласс: {grade}\n"
+            f"ФИО: {name}\nТелефон: {phone}\n"
             f"Дата/время: {date_text} {time_text}\nUser ID: {user_id}"
         )
     else:
         # Сценарий: пользователь просто редактирует свои данные из вкладки "Другое"
-        update_lead_profile(user_id, name, phone, grade)
+        update_lead_profile(user_id, name, phone)
         await message.answer("Ваши данные обновлены.", reply_markup=back_btn())
 
     await state.clear()
@@ -428,7 +434,7 @@ async def other_question(message: Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "cancel")
 async def cancel(callback: CallbackQuery, state: FSMContext):
     # "Отмена" ведёт себя как "Назад": редактируем сообщение, возвращая к темам.
-    # Если слот уже был забронирован (мы в процессе донабора ФИО/телефона/класса),
+    # Если слот уже был забронирован (мы в процессе донабора ФИО/телефона),
     # а пользователь передумал — саму запись тоже нужно отменить, иначе слот
     # останется "висеть" занятым без данных лида.
     data = await state.get_data()
@@ -504,13 +510,13 @@ async def remind_book_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     set_next_reminder(user_id, None)
 
-    existing = get_user_appointments(user_id)
+    existing = get_active_user_appointments(user_id)
     if existing:
-        date_text, time_text, status = existing[0]
+        _, date_text, time_text, status = existing[0]
         await edit_in_place(
             callback.message,
             m("APPOINTMENT_EXISTS").format(date_text, time_text),
-            appointment_action_btn()
+            appointment_cancel_only_btn()
         )
         await state.set_state(States.appointment_cancel)
     else:
@@ -529,7 +535,7 @@ async def admin_panel(message: Message):
         return
     await message.answer("Панель администратора:", reply_markup=admin_menu_btn())
 
-@dp.callback_query(lambda c: c.data.startswith("admin_"))
+@dp.callback_query(lambda c: c.data.startswith("admin_") and not c.data.startswith("admin_select_delete_"))
 async def admin_handlers(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
@@ -714,7 +720,7 @@ def build_export_workbook() -> str:
     ws.title = "Записи"
 
     headers = [
-        "User ID", "Username", "ФИО", "Телефон", "Класс",
+        "User ID", "Username", "ФИО", "Телефон",
         "Тема", "Статус лида", "Создан",
         "Дата встречи", "Время встречи", "Статус записи",
     ]
